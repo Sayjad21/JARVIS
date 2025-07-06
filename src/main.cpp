@@ -10,8 +10,9 @@
 const char *ssid = "KNIH READING ROOM";
 const char *password = "KNIH READING ROOM";
 
-// Deepgram API Key
+// API Keys
 const char *DEEPGRAM_API_KEY = "0e572262ba3ac751d97725145dcfe7a9fcf21d91";
+const char *GEMINI_API_KEY = "AIzaSyC4rIZxYEk8P_cGqTK2uADBSYvVN4duBOE";
 
 // I2S Microphone pins configuration
 #define I2S_MIC_WS_PIN 4  // Word Select (LR)
@@ -62,13 +63,14 @@ void deleteAllFiles();
 void transcribeLatestRecording();
 void setupWifi();
 void writeWavHeader(File &file, uint32_t sampleRate, uint16_t bitsPerSample, uint16_t channels, uint32_t dataSize);
+void generateGeminiResponse(String transcript);
 
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("=== ESP32-S3 I2S Audio Recorder + Player ===");
+  Serial.println("=== ESP32-S3 I2S Audio Recorder + AI Assistant ===");
   Serial.println("Hardware Configuration:");
   Serial.println("I2S Microphone:");
   Serial.println("  WS (LR) -> Pin 4");
@@ -104,7 +106,7 @@ void setup()
   Serial.println("  'q' - Stop playback");
   Serial.println("  't' - Play test tone");
   Serial.println("  'd' - Delete all audio files");
-  Serial.println("  'c' - Convert latest recording to text");
+  Serial.println("  'c' - Convert latest recording to text and get AI response");
   Serial.println();
 
   setupWifi();
@@ -380,6 +382,97 @@ void playLatestRecording()
   Serial.println("\nPlayback finished!");
 }
 
+void generateGeminiResponse(String transcript)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi not connected. Cannot generate AI response.");
+    return;
+  }
+
+  Serial.println("\n=== Generating AI Response ===");
+  Serial.println("Sending to Gemini AI...");
+
+  HTTPClient http;
+  String url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent";
+  
+  http.begin(url);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("X-goog-api-key", GEMINI_API_KEY);
+
+  // Create JSON payload
+  DynamicJsonDocument doc(2048);
+  JsonArray contents = doc.createNestedArray("contents");
+  JsonObject content = contents.createNestedObject();
+  JsonArray parts = content.createNestedArray("parts");
+  JsonObject part = parts.createNestedObject();
+  part["text"] = transcript;
+
+  String jsonString;
+  serializeJson(doc, jsonString);
+
+  Serial.println("Sending request to Gemini...");
+  int httpCode = http.POST(jsonString);
+
+  if (httpCode > 0)
+  {
+    Serial.printf("[HTTP] POST... code: %d\n", httpCode);
+    
+    if (httpCode == HTTP_CODE_OK)
+    {
+      String payload = http.getString();
+      
+      // Parse the JSON response
+      DynamicJsonDocument responseDoc(8192);
+      DeserializationError error = deserializeJson(responseDoc, payload);
+      
+      if (error)
+      {
+        Serial.print("JSON parsing failed: ");
+        Serial.println(error.c_str());
+        Serial.println("Raw response:");
+        Serial.println(payload);
+      }
+      else
+      {
+        // Extract the AI response text
+        if (responseDoc.containsKey("candidates") && 
+            responseDoc["candidates"].size() > 0 &&
+            responseDoc["candidates"][0].containsKey("content") &&
+            responseDoc["candidates"][0]["content"].containsKey("parts") &&
+            responseDoc["candidates"][0]["content"]["parts"].size() > 0 &&
+            responseDoc["candidates"][0]["content"]["parts"][0].containsKey("text"))
+        {
+          String aiResponse = responseDoc["candidates"][0]["content"]["parts"][0]["text"];
+          
+          Serial.println("\n=== AI RESPONSE ===");
+          Serial.println(aiResponse);
+          Serial.println("===================\n");
+        }
+        else
+        {
+          Serial.println("Could not extract AI response from JSON");
+          Serial.println("Raw response:");
+          Serial.println(payload);
+        }
+      }
+    }
+    else
+    {
+      Serial.println("Gemini API did not return HTTP 200 OK.");
+      String errorResponse = http.getString();
+      Serial.println("Error response:");
+      Serial.println(errorResponse);
+    }
+  }
+  else
+  {
+    Serial.printf("[HTTP] POST... failed, error: %s\n", http.errorToString(httpCode).c_str());
+  }
+
+  http.end();
+}
+
 void transcribeLatestRecording()
 {
   if (recording || playing)
@@ -467,6 +560,8 @@ void transcribeLatestRecording()
     return;
   }
 
+  String transcript = "";
+  
   if (WiFi.status() == WL_CONNECTED)
   {
     HTTPClient http;
@@ -483,7 +578,7 @@ void transcribeLatestRecording()
       if (httpCode == HTTP_CODE_OK)
       {
         String payload = http.getString();
-        // Only print the transcript
+        // Extract transcript
         int tIndex = payload.indexOf("\"transcript\":");
         if (tIndex != -1)
         {
@@ -491,10 +586,20 @@ void transcribeLatestRecording()
           int end = payload.indexOf('"', start);
           if (start > 0 && end > start)
           {
-            String transcript = payload.substring(start, end);
-            Serial.println("--- Transcript ---");
+            transcript = payload.substring(start, end);
+            Serial.println("\n=== TRANSCRIPT ===");
             Serial.println(transcript);
-            Serial.println("--------------------");
+            Serial.println("==================");
+            
+            // Generate AI response if transcript is not empty
+            if (transcript.length() > 0 && transcript != "")
+            {
+              generateGeminiResponse(transcript);
+            }
+            else
+            {
+              Serial.println("Transcript is empty, skipping AI response generation.");
+            }
           }
           else
           {
