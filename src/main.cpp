@@ -26,18 +26,36 @@
 #define SAMPLE_BITS 16
 #define CHANNEL_NUM 1
 
-// Recording configuration - REDUCED BUFFER SIZE
+// Recording configuration
 #define RECORD_TIME 10 // Record for 10 seconds
-#define BUFFER_SIZE 512  // Reduced from 1024 to 512
+#define BUFFER_SIZE 512
 
 File audioFile;
 bool recording = false;
 bool playing = false;
 unsigned long recordStartTime = 0;
+uint32_t audioDataSize = 0;  // Track audio data size for WAV header
 
 // Allocate buffers in global memory instead of stack
 int16_t audioBuffer[BUFFER_SIZE];
 int32_t stereoBuffer[BUFFER_SIZE * 2];
+
+// WAV file header structure
+struct WAVHeader {
+  char riff[4] = {'R', 'I', 'F', 'F'};
+  uint32_t fileSize;
+  char wave[4] = {'W', 'A', 'V', 'E'};
+  char fmt[4] = {'f', 'm', 't', ' '};
+  uint32_t fmtSize = 16;
+  uint16_t audioFormat = 1; // PCM
+  uint16_t numChannels = CHANNEL_NUM;
+  uint32_t sampleRate = SAMPLE_RATE;
+  uint32_t byteRate = SAMPLE_RATE * CHANNEL_NUM * (SAMPLE_BITS / 8);
+  uint16_t blockAlign = CHANNEL_NUM * (SAMPLE_BITS / 8);
+  uint16_t bitsPerSample = SAMPLE_BITS;
+  char data[4] = {'d', 'a', 't', 'a'};
+  uint32_t dataSize;
+};
 
 // Function Declarations
 void setupMicrophone();
@@ -49,13 +67,15 @@ void stopPlayback();
 void listFiles();
 void testTone();
 void deleteAllFiles();
+void writeWAVHeader(File &file, uint32_t dataSize);
+void updateWAVHeader(File &file, uint32_t dataSize);
 
 void setup()
 {
   Serial.begin(115200);
   delay(1000);
 
-  Serial.println("=== ESP32-S3 I2S Audio Recorder + Player ===");
+  Serial.println("=== ESP32-S3 I2S Audio Recorder + Player (WAV Format) ===");
   Serial.println("Hardware Configuration:");
   Serial.println("I2S Microphone:");
   Serial.println("  WS (LR) -> Pin 4");
@@ -94,6 +114,27 @@ void setup()
   Serial.println();
 }
 
+void writeWAVHeader(File &file, uint32_t dataSize) {
+  WAVHeader header;
+  header.dataSize = dataSize;
+  header.fileSize = dataSize + sizeof(WAVHeader) - 8;
+  
+  file.seek(0);
+  file.write((uint8_t*)&header, sizeof(header));
+}
+
+void updateWAVHeader(File &file, uint32_t dataSize) {
+  // Update the data size and file size in the header
+  file.seek(4);
+  uint32_t fileSize = dataSize + sizeof(WAVHeader) - 8;
+  file.write((uint8_t*)&fileSize, 4);
+  
+  file.seek(40);
+  file.write((uint8_t*)&dataSize, 4);
+}
+
+// ... [setupMicrophone and setupSpeaker functions remain the same] ...
+
 void setupMicrophone()
 {
   i2s_config_t i2s_mic_config = {
@@ -103,8 +144,8 @@ void setupMicrophone()
       .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-      .dma_buf_count = 4,  // Reduced from 8 to 4
-      .dma_buf_len = 512,  // Reduced from 1024 to 512
+      .dma_buf_count = 4,
+      .dma_buf_len = 512,
       .use_apll = false,
       .tx_desc_auto_clear = false,
       .fixed_mclk = 0
@@ -140,7 +181,7 @@ void setupSpeaker()
       .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
       .sample_rate = SAMPLE_RATE,
       .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
-      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,  // Changed to mono for MAX98357A
+      .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
       .communication_format = I2S_COMM_FORMAT_STAND_I2S,
       .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
       .dma_buf_count = 4,
@@ -182,7 +223,7 @@ void startRecording()
     return;
   }
 
-  String filename = "/audio_" + String(millis()) + ".raw";
+  String filename = "/audio_" + String(millis()) + ".wav";  // Changed to .wav
 
   audioFile = SD.open(filename, FILE_WRITE);
   if (!audioFile)
@@ -190,6 +231,10 @@ void startRecording()
     Serial.println("ERROR: Failed to create audio file!");
     return;
   }
+
+  // Write initial WAV header (will be updated when recording stops)
+  writeWAVHeader(audioFile, 0);
+  audioDataSize = 0;
 
   recording = true;
   recordStartTime = millis();
@@ -206,10 +251,14 @@ void stopRecording()
   }
 
   recording = false;
+  
+  // Update WAV header with actual data size
+  updateWAVHeader(audioFile, audioDataSize);
   audioFile.close();
 
   unsigned long recordDuration = (millis() - recordStartTime) / 1000;
   Serial.printf("Recording stopped. Duration: %lu seconds\n", recordDuration);
+  Serial.printf("Audio data size: %u bytes\n", audioDataSize);
 }
 
 void playLatestRecording()
@@ -228,11 +277,11 @@ void playLatestRecording()
   File file = root.openNextFile();
   while (file)
   {
-    if (!file.isDirectory() && String(file.name()).endsWith(".raw"))
+    if (!file.isDirectory() && String(file.name()).endsWith(".wav"))  // Look for .wav files
     {
       String fileName = String(file.name());
       int startPos = fileName.indexOf("_") + 1;
-      int endPos = fileName.indexOf(".raw");
+      int endPos = fileName.indexOf(".wav");
       if (startPos > 0 && endPos > startPos)
       {
         unsigned long fileTime = fileName.substring(startPos, endPos).toInt();
@@ -254,12 +303,10 @@ void playLatestRecording()
 
   if (latestFileName == "")
   {
-    Serial.println("No audio files found!");
+    Serial.println("No WAV audio files found!");
     return;
   }
 
-  Serial.println("Attempting to play: " + latestFileName);
-  
   audioFile = SD.open(latestFileName, FILE_READ);
   if (!audioFile)
   {
@@ -267,11 +314,14 @@ void playLatestRecording()
     return;
   }
 
+  // Skip WAV header (44 bytes)
+  audioFile.seek(44);
+
   playing = true;
   Serial.println("Playing: " + latestFileName);
   Serial.printf("File size: %d bytes\n", audioFile.size());
 
-  // For mono MAX98357A - send data directly without stereo conversion
+  // Play audio data (skip header)
   while (audioFile.available() && playing)
   {
     int bytesRead = audioFile.read((uint8_t*)audioBuffer, sizeof(audioBuffer));
@@ -287,10 +337,9 @@ void playLatestRecording()
         break;
       }
       
-      Serial.print(".");  // Progress indicator
+      Serial.print(".");
     }
 
-    // Check for stop command
     if (Serial.available())
     {
       char command = Serial.read();
@@ -331,7 +380,17 @@ void listFiles()
   {
     if (!file.isDirectory())
     {
-      Serial.printf("  %s (%d bytes)\n", file.name(), file.size());
+      String fileName = String(file.name());
+      Serial.printf("  %s (%d bytes)", fileName.c_str(), file.size());
+      
+      // Show file type
+      if (fileName.endsWith(".wav")) {
+        Serial.println(" [WAV Audio]");
+      } else if (fileName.endsWith(".raw")) {
+        Serial.println(" [RAW Audio]");
+      } else {
+        Serial.println();
+      }
     }
     file.close();
     file = root.openNextFile();
@@ -344,14 +403,12 @@ void testTone()
   Serial.println("Playing test tone for 3 seconds...");
   playing = true;
   
-  // Generate a simple 1kHz sine wave
-  for (int j = 0; j < 3000 && playing; j++)  // 3 seconds
+  for (int j = 0; j < 3000 && playing; j++)
   {
     for (int i = 0; i < BUFFER_SIZE; i++)
     {
-      // Generate 1kHz sine wave at 16kHz sample rate
       float sample = sin(2.0 * PI * 1000.0 * (j * BUFFER_SIZE + i) / SAMPLE_RATE);
-      audioBuffer[i] = (int16_t)(sample * 8000);  // Scale to 16-bit
+      audioBuffer[i] = (int16_t)(sample * 8000);
     }
     
     size_t bytes_written = 0;
@@ -363,7 +420,6 @@ void testTone()
       break;
     }
     
-    // Check for stop command
     if (Serial.available())
     {
       char command = Serial.read();
@@ -391,9 +447,8 @@ void deleteAllFiles()
   Serial.println("WARNING: This will delete ALL audio files!");
   Serial.println("Press 'y' to confirm or any other key to cancel...");
   
-  // Wait for confirmation
   unsigned long startTime = millis();
-  while (!Serial.available() && (millis() - startTime) < 10000) // 10 second timeout
+  while (!Serial.available() && (millis() - startTime) < 10000)
   {
     delay(100);
   }
@@ -424,7 +479,7 @@ void deleteAllFiles()
     int fileSize = file.size();
     file.close();
     
-    if (fileName.endsWith(".raw"))
+    if (fileName.endsWith(".wav") || fileName.endsWith(".raw"))  // Include both formats
     {
       String fullPath = "/" + fileName;
       if (fileName.startsWith("/"))
@@ -462,7 +517,6 @@ void deleteAllFiles()
 
 void loop()
 {
-  // Check for serial commands
   if (Serial.available())
   {
     char command = Serial.read();
@@ -499,7 +553,7 @@ void loop()
     }
   }
 
-  // Recording loop - using global buffer
+  // Recording loop
   if (!playing)
   {
     size_t bytes_read = 0;
@@ -507,7 +561,6 @@ void loop()
 
     if (result == ESP_OK && bytes_read > 0)
     {
-      // Calculate audio level
       int samples_read = bytes_read / sizeof(int16_t);
       long sum = 0;
       for (int i = 0; i < samples_read; i++)
@@ -516,10 +569,9 @@ void loop()
       }
 
       float rms = sqrt(sum / samples_read);
-      int level = map(rms, 0, 4000, 0, 10);  // Reduced scale
+      int level = map(rms, 0, 4000, 0, 10);
 
-      // Display audio level (less frequent)
-      if (level > 1 && millis() % 200 < 50)  // Only show every 200ms
+      if (level > 1 && millis() % 200 < 50)
       {
         Serial.print(recording ? "REC " : "    ");
         Serial.print("Audio: ");
@@ -530,10 +582,10 @@ void loop()
         Serial.printf(" (%.0f)\n", rms);
       }
 
-      // Save to SD card if recording
       if (recording)
       {
         audioFile.write((uint8_t*)audioBuffer, bytes_read);
+        audioDataSize += bytes_read;  // Track total audio data written
 
         if (millis() - recordStartTime > RECORD_TIME * 1000)
         {
@@ -543,5 +595,5 @@ void loop()
     }
   }
 
-  delay(10);  // Reduced delay
+  delay(10);
 }
