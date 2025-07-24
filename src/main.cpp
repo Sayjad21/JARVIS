@@ -12,7 +12,7 @@ const char *ssid = "KNIH READING ROOM";
 const char *password = "KNIH READING ROOM";
 
 // API Keys
-const char *DEEPGRAM_API_KEY = "0c1387dbf1475f3ed072a164ed1ff5aa00900bf4";
+const char *DEEPGRAM_API_KEY = "e60e9df39a10927457676c9e31fb51b883750c4b";
 const char *GEMINI_API_KEY = "AIzaSyC4rIZxYEk8P_cGqTK2uADBSYvVN4duBOE";
 
 // I2S Microphone pins configuration
@@ -556,6 +556,30 @@ void transcribeLatestRecording()
     Serial.println("\n=== TRANSCRIPT ===");
     Serial.println(transcript);
     Serial.println("==================");
+
+    // Convert transcript to lowercase for case-insensitive comparison
+    String lowerTranscript = transcript;
+    lowerTranscript.toLowerCase();
+
+    // Check for "on" or "off" commands
+    if (lowerTranscript.indexOf("on") != -1)
+    {
+      Serial.println("Voice command detected: ON");
+      //pinMode(ATMEGA_CTRL_PIN, OUTPUT);
+      digitalWrite(ATMEGA_CTRL_PIN, HIGH);
+      Serial.println("Sent logic 1 to ATmega32 (pin 40)");
+      return; // Exit function without calling Gemini
+    }
+    else if (lowerTranscript.indexOf("off") != -1)
+    {
+      Serial.println("Voice command detected: OFF");
+      //pinMode(ATMEGA_CTRL_PIN, OUTPUT);
+      digitalWrite(ATMEGA_CTRL_PIN, LOW);
+      Serial.println("Sent logic 0 to ATmega32 (pin 40)");
+      return; // Exit function without calling Gemini
+    }
+
+    // If no "on" or "off" detected, proceed with normal AI response
 
     // Generate AI response
     generateGeminiResponse(transcript);
