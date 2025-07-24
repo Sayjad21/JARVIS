@@ -42,6 +42,8 @@ const char *GEMINI_API_KEY = "AIzaSyC4rIZxYEk8P_cGqTK2uADBSYvVN4duBOE";
 #define RECORD_TIME 10  // Record for 10 seconds
 #define BUFFER_SIZE 512 // Reduced from 1024 to 512
 
+#define ATMEGA_CTRL_PIN 8
+
 File audioFile;
 bool recording = false;
 bool playing = false;
@@ -70,6 +72,7 @@ void writeWavHeader(File &file, uint32_t sampleRate, uint16_t bitsPerSample, uin
 void generateGeminiResponse(String transcript);
 String SpeechToText_Deepgram(String audio_filename);
 String json_object(String input, String element);
+void speakWithElevenLabs(String text);
 
 void setup()
 {
@@ -119,6 +122,9 @@ void setup()
 
   // Initialize WiFiClientSecure
   client.setInsecure(); // Add this line after setupWifi()
+
+  pinMode(ATMEGA_CTRL_PIN, OUTPUT);
+  digitalWrite(ATMEGA_CTRL_PIN, LOW);
 }
 
 void setupWifi()
@@ -457,6 +463,9 @@ void generateGeminiResponse(String transcript)
           Serial.println("\n=== AI RESPONSE ===");
           Serial.println(aiResponse);
           Serial.println("===================\n");
+
+            // Speak the AI response using ElevenLabs
+            speakWithElevenLabs(aiResponse);
         }
         else
         {
@@ -550,12 +559,85 @@ void transcribeLatestRecording()
 
     // Generate AI response
     generateGeminiResponse(transcript);
+
+    
   }
   else
   {
     Serial.println("Transcript is empty or transcription failed.");
   }
 }
+
+
+void speakWithElevenLabs(String text)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi not connected. Cannot use ElevenLabs.");
+    return;
+  }
+
+  Serial.println("\n=== Converting Text to Speech with ElevenLabs ===");
+
+  HTTPClient http;
+  String url = "https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb?output_format=pcm_16000";
+
+  http.begin(url);
+  http.addHeader("xi-api-key", "sk_d8bb7b04566a2d62e2ae54552444167017874714a01e65d0");
+  http.addHeader("Content-Type", "application/json");
+
+  DynamicJsonDocument doc(1024);
+  doc["text"] = text;
+  doc["model_id"] = "eleven_multilingual_v2";
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  int httpCode = http.POST(requestBody);
+
+  if (httpCode == HTTP_CODE_OK)
+  {
+    WiFiClient *stream = http.getStreamPtr();
+
+    String filename = "/tts_" + String(millis()) + ".wav";
+    File outFile = SD.open(filename, FILE_WRITE);
+
+    if (!outFile)
+    {
+      Serial.println("Failed to create file on SD!");
+      http.end();
+      return;
+    }
+
+    Serial.println("Writing WAV header placeholder...");
+    for (int i = 0; i < 44; i++) outFile.write((byte)0); // Reserve header
+
+    uint32_t audioLength = 0;
+
+    while (http.connected() && stream->available())
+    {
+      uint8_t buffer[512];
+      int len = stream->readBytes(buffer, sizeof(buffer));
+      outFile.write(buffer, len);
+      audioLength += len;
+    }
+
+    writeWavHeader(outFile, 16000, 16, 1, audioLength); // Mono 16-bit WAV
+    outFile.close();
+    http.end();
+
+    Serial.println("TTS audio saved. Playing...");
+    delay(500);
+    playLatestRecording(); // Play immediately
+  }
+  else
+  {
+    Serial.printf("TTS request failed: %d\n", httpCode);
+    Serial.println(http.getString());
+    http.end();
+  }
+}
+
 
 void stopPlayback()
 {
@@ -877,6 +959,16 @@ void loop()
     case 'c':
     case 'C':
       transcribeLatestRecording();
+      break;
+    case 'b':
+    case 'B':
+      digitalWrite(ATMEGA_CTRL_PIN, HIGH);
+      Serial.println("Sent logic 1 to ATmega32 (pin 40)");
+      break;
+    case 'n':
+    case 'N':
+      digitalWrite(ATMEGA_CTRL_PIN, LOW);
+      Serial.println("Sent logic 0 to ATmega32 (pin 40)");
       break;
     }
   }
