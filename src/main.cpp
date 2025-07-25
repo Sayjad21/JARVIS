@@ -12,7 +12,7 @@ const char *ssid = "KNIH READING ROOM";
 const char *password = "KNIH READING ROOM";
 
 // API Keys
-const char *DEEPGRAM_API_KEY = "e60e9df39a10927457676c9e31fb51b883750c4b";
+const char *DEEPGRAM_API_KEY = "21b44d737aae0547c3c21069a775fda699c73e91";
 const char *GEMINI_API_KEY = "AIzaSyC4rIZxYEk8P_cGqTK2uADBSYvVN4duBOE";
 
 // I2S Microphone pins configuration
@@ -43,7 +43,8 @@ const char *GEMINI_API_KEY = "AIzaSyC4rIZxYEk8P_cGqTK2uADBSYvVN4duBOE";
 #define BUFFER_SIZE 512 // Reduced from 1024 to 512
 
 #define ATMEGA_CTRL_PIN 8
-
+// Add this after your other global variables (around line 47)
+String lastTTSFile = "";
 File audioFile;
 bool recording = false;
 bool playing = false;
@@ -62,6 +63,7 @@ void setupSpeaker();
 void startRecording();
 void stopRecording();
 void playLatestRecording();
+void playSpecificFile(String filename); // Add this line
 void stopPlayback();
 void listFiles();
 void testTone();
@@ -72,7 +74,7 @@ void writeWavHeader(File &file, uint32_t sampleRate, uint16_t bitsPerSample, uin
 void generateGeminiResponse(String transcript);
 String SpeechToText_Deepgram(String audio_filename);
 String json_object(String input, String element);
-void speakWithElevenLabs(String text);
+void speakWithDeepgram(String text);
 
 void setup()
 {
@@ -92,21 +94,34 @@ void setup()
   Serial.println("  SD -> 3.3V (Enable)");
   Serial.println();
 
-  // Initialize SD card
+  // Initialize SD card with better error handling
+  Serial.println("Initializing SD card...");
   SPI.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
-  if (!SD.begin(SD_CS_PIN))
+
+  bool sdInitialized = false;
+  for (int attempt = 0; attempt < 3; attempt++)
   {
-    Serial.println("ERROR: SD card initialization failed!");
-    return;
+    Serial.printf("SD card initialization attempt %d...\n", attempt + 1);
+    if (SD.begin(SD_CS_PIN))
+    {
+      sdInitialized = true;
+      Serial.println("SD card initialized successfully!");
+      uint64_t cardSize = SD.cardSize() / (1024 * 1024);
+      Serial.printf("SD card size: %lluMB\n", cardSize);
+      break;
+    }
+    delay(1000);
   }
-  Serial.println("SD card initialized successfully!");
-  uint64_t cardSize = SD.cardSize() / (1024 * 1024);
-  Serial.printf("SD card size: %lluMB\n", cardSize);
+
+  if (!sdInitialized)
+  {
+    Serial.println("WARNING: SD card initialization failed!");
+    Serial.println("Recording and playback will not work, but transcription may still work.");
+  }
 
   setupMicrophone();
   setupSpeaker();
 
-  Serial.println();
   Serial.println("Commands:");
   Serial.println("  's' - Start recording");
   Serial.println("  'x' - Stop recording");
@@ -116,15 +131,19 @@ void setup()
   Serial.println("  't' - Play test tone");
   Serial.println("  'd' - Delete all audio files");
   Serial.println("  'c' - Convert latest recording to text and get AI response");
+  Serial.println("  'v' - Replay last TTS audio"); // Add this line
   Serial.println();
 
+  // Always initialize WiFi regardless of SD card status
   setupWifi();
 
   // Initialize WiFiClientSecure
-  client.setInsecure(); // Add this line after setupWifi()
+  client.setInsecure();
 
   pinMode(ATMEGA_CTRL_PIN, OUTPUT);
   digitalWrite(ATMEGA_CTRL_PIN, LOW);
+
+  Serial.println("Setup completed!");
 }
 
 void setupWifi()
@@ -397,6 +416,87 @@ void playLatestRecording()
   Serial.println("\nPlayback finished!");
 }
 
+// Add this function after playLatestRecording()
+void playSpecificFile(String filename)
+{
+  if (recording || playing)
+  {
+    Serial.println("Cannot play while recording or already playing!");
+    return;
+  }
+
+  Serial.println("Attempting to play: " + filename);
+
+  audioFile = SD.open(filename, FILE_READ);
+  if (!audioFile)
+  {
+    Serial.println("ERROR: Failed to open audio file for playback!");
+    return;
+  }
+
+  playing = true;
+  Serial.println("Playing: " + filename);
+  Serial.printf("File size: %d bytes\n", audioFile.size());
+
+  // Skip WAV header (44 bytes)
+  audioFile.seek(44);
+
+  // For mono MAX98357A - send data directly without stereo conversion
+  while (audioFile.available() && playing)
+  {
+    int bytesRead = audioFile.read((uint8_t *)audioBuffer, sizeof(audioBuffer));
+
+    if (bytesRead > 0)
+    {
+      size_t bytes_written = 0;
+      esp_err_t result = i2s_write(I2S_SPK_PORT, audioBuffer, bytesRead, &bytes_written, portMAX_DELAY);
+
+      if (result != ESP_OK)
+      {
+        Serial.printf("ERROR writing to I2S: %s\n", esp_err_to_name(result));
+        break;
+      }
+
+      Serial.print("."); // Progress indicator
+    }
+
+    // Check for stop command
+    if (Serial.available())
+    {
+      char command = Serial.read();
+      if (command == 'q' || command == 'Q')
+      {
+        break;
+      }
+    }
+
+    delay(1);
+  }
+
+  audioFile.close();
+  playing = false;
+  Serial.println("\nPlayback finished!");
+}
+
+// Add this function before generateGeminiResponse
+String cleanText(String input)
+{
+  String output = "";
+  for (size_t i = 0; i < input.length(); i++)
+  {
+    char c = input.charAt(i);
+    // Allow only letters, numbers, space, and basic punctuation
+    if ((c >= 'a' && c <= 'z') ||
+        (c >= 'A' && c <= 'Z') ||
+        (c >= '0' && c <= '9') ||
+        c == ' ' || c == '.' || c == ',' || c == '-' || c == '_')
+    {
+      output += c;
+    }
+  }
+  return output;
+}
+
 void generateGeminiResponse(String transcript)
 {
   if (WiFi.status() != WL_CONNECTED)
@@ -415,13 +515,15 @@ void generateGeminiResponse(String transcript)
   http.addHeader("Content-Type", "application/json");
   http.addHeader("X-goog-api-key", GEMINI_API_KEY);
 
-  // Create JSON payload
+  // Create JSON payload with instruction for one-line response
   DynamicJsonDocument doc(2048);
   JsonArray contents = doc.createNestedArray("contents");
   JsonObject content = contents.createNestedObject();
   JsonArray parts = content.createNestedArray("parts");
   JsonObject part = parts.createNestedObject();
-  part["text"] = transcript;
+
+  // Add instruction for one-line response without special characters
+  part["text"] = transcript + ". Please answer in one line only, do not use special characters or formatting.";
 
   String jsonString;
   serializeJson(doc, jsonString);
@@ -460,12 +562,15 @@ void generateGeminiResponse(String transcript)
         {
           String aiResponse = responseDoc["candidates"][0]["content"]["parts"][0]["text"];
 
+          // Clean the response to remove special characters
+          aiResponse = cleanText(aiResponse);
+
           Serial.println("\n=== AI RESPONSE ===");
           Serial.println(aiResponse);
           Serial.println("===================\n");
 
-            // Speak the AI response using ElevenLabs
-            speakWithElevenLabs(aiResponse);
+          // Send cleaned response to TTS
+          speakWithDeepgram(aiResponse);
         }
         else
         {
@@ -565,7 +670,7 @@ void transcribeLatestRecording()
     if (lowerTranscript.indexOf("on") != -1)
     {
       Serial.println("Voice command detected: ON");
-      //pinMode(ATMEGA_CTRL_PIN, OUTPUT);
+      // pinMode(ATMEGA_CTRL_PIN, OUTPUT);
       digitalWrite(ATMEGA_CTRL_PIN, HIGH);
       Serial.println("Sent logic 1 to ATmega32 (pin 40)");
       return; // Exit function without calling Gemini
@@ -573,7 +678,7 @@ void transcribeLatestRecording()
     else if (lowerTranscript.indexOf("off") != -1)
     {
       Serial.println("Voice command detected: OFF");
-      //pinMode(ATMEGA_CTRL_PIN, OUTPUT);
+      // pinMode(ATMEGA_CTRL_PIN, OUTPUT);
       digitalWrite(ATMEGA_CTRL_PIN, LOW);
       Serial.println("Sent logic 0 to ATmega32 (pin 40)");
       return; // Exit function without calling Gemini
@@ -583,8 +688,6 @@ void transcribeLatestRecording()
 
     // Generate AI response
     generateGeminiResponse(transcript);
-
-    
   }
   else
   {
@@ -592,76 +695,74 @@ void transcribeLatestRecording()
   }
 }
 
+// void speakWithElevenLabs(String text)
+// {
+//   if (WiFi.status() != WL_CONNECTED)
+//   {
+//     Serial.println("WiFi not connected. Cannot use ElevenLabs.");
+//     return;
+//   }
 
-void speakWithElevenLabs(String text)
-{
-  if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.println("WiFi not connected. Cannot use ElevenLabs.");
-    return;
-  }
+//   Serial.println("\n=== Converting Text to Speech with ElevenLabs ===");
 
-  Serial.println("\n=== Converting Text to Speech with ElevenLabs ===");
+//   HTTPClient http;
+//   String url = "https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb?output_format=pcm_16000";
 
-  HTTPClient http;
-  String url = "https://api.elevenlabs.io/v1/text-to-speech/JBFqnCBsd6RMkjVDRZzb?output_format=pcm_16000";
+//   http.begin(url);
+//   http.addHeader("xi-api-key", "sk_d8bb7b04566a2d62e2ae54552444167017874714a01e65d0");
+//   http.addHeader("Content-Type", "application/json");
 
-  http.begin(url);
-  http.addHeader("xi-api-key", "sk_d8bb7b04566a2d62e2ae54552444167017874714a01e65d0");
-  http.addHeader("Content-Type", "application/json");
+//   DynamicJsonDocument doc(1024);
+//   doc["text"] = text;
+//   doc["model_id"] = "eleven_multilingual_v2";
 
-  DynamicJsonDocument doc(1024);
-  doc["text"] = text;
-  doc["model_id"] = "eleven_multilingual_v2";
+//   String requestBody;
+//   serializeJson(doc, requestBody);
 
-  String requestBody;
-  serializeJson(doc, requestBody);
+//   int httpCode = http.POST(requestBody);
 
-  int httpCode = http.POST(requestBody);
+//   if (httpCode == HTTP_CODE_OK)
+//   {
+//     WiFiClient *stream = http.getStreamPtr();
 
-  if (httpCode == HTTP_CODE_OK)
-  {
-    WiFiClient *stream = http.getStreamPtr();
+//     String filename = "/tts_" + String(millis()) + ".wav";
+//     File outFile = SD.open(filename, FILE_WRITE);
 
-    String filename = "/tts_" + String(millis()) + ".wav";
-    File outFile = SD.open(filename, FILE_WRITE);
+//     if (!outFile)
+//     {
+//       Serial.println("Failed to create file on SD!");
+//       http.end();
+//       return;
+//     }
 
-    if (!outFile)
-    {
-      Serial.println("Failed to create file on SD!");
-      http.end();
-      return;
-    }
+//     Serial.println("Writing WAV header placeholder...");
+//     for (int i = 0; i < 44; i++) outFile.write((byte)0); // Reserve header
 
-    Serial.println("Writing WAV header placeholder...");
-    for (int i = 0; i < 44; i++) outFile.write((byte)0); // Reserve header
+//     uint32_t audioLength = 0;
 
-    uint32_t audioLength = 0;
+//     while (http.connected() && stream->available())
+//     {
+//       uint8_t buffer[512];
+//       int len = stream->readBytes(buffer, sizeof(buffer));
+//       outFile.write(buffer, len);
+//       audioLength += len;
+//     }
 
-    while (http.connected() && stream->available())
-    {
-      uint8_t buffer[512];
-      int len = stream->readBytes(buffer, sizeof(buffer));
-      outFile.write(buffer, len);
-      audioLength += len;
-    }
+//     writeWavHeader(outFile, 16000, 16, 1, audioLength); // Mono 16-bit WAV
+//     outFile.close();
+//     http.end();
 
-    writeWavHeader(outFile, 16000, 16, 1, audioLength); // Mono 16-bit WAV
-    outFile.close();
-    http.end();
-
-    Serial.println("TTS audio saved. Playing...");
-    delay(500);
-    playLatestRecording(); // Play immediately
-  }
-  else
-  {
-    Serial.printf("TTS request failed: %d\n", httpCode);
-    Serial.println(http.getString());
-    http.end();
-  }
-}
-
+//     Serial.println("TTS audio saved. Playing...");
+//     delay(500);
+//     playLatestRecording(); // Play immediately
+//   }
+//   else
+//   {
+//     Serial.printf("TTS request failed: %d\n", httpCode);
+//     Serial.println(http.getString());
+//     http.end();
+//   }
+// }
 
 void stopPlayback()
 {
@@ -846,26 +947,20 @@ String SpeechToText_Deepgram(String audio_filename)
   Serial.println("> Audio File [" + audio_filename + "] found, size: " + String(audio_size));
 
   // Flush potential inbound streaming data
-  String socketcontent = "";
   while (client.available())
   {
-    char c = client.read();
-    socketcontent += String(c);
+    client.read();
   }
 
   // Send HTTPS request header to Deepgram Server
-  String optional_param;
-  optional_param = "?model=nova-2-general";
-  optional_param += "&language=en";
-  optional_param += "&smart_format=true";
-  optional_param += "&numerals=true";
+  String optional_param = "?model=nova-2-general&language=en&smart_format=true&numerals=true";
 
   client.println("POST /v1/listen" + optional_param + " HTTP/1.1");
   client.println("Host: api.deepgram.com");
   client.println("Authorization: Token " + String(DEEPGRAM_API_KEY));
   client.println("Content-Type: audio/wav");
   client.println("Content-Length: " + String(audio_size));
-  client.println(); // header complete
+  client.println();
 
   Serial.println("> POST Request to Deepgram Server started, sending WAV data now ...");
 
@@ -873,30 +968,38 @@ String SpeechToText_Deepgram(String audio_filename)
   File file = SD.open(audio_filename, FILE_READ);
   const size_t bufferSize = 1024;
   uint8_t buffer[bufferSize];
-  size_t bytesRead;
+  size_t totalSent = 0;
+
   while (file.available())
   {
-    bytesRead = file.read(buffer, sizeof(buffer));
+    size_t bytesRead = file.read(buffer, sizeof(buffer));
     if (bytesRead > 0)
     {
       client.write(buffer, bytesRead);
+      totalSent += bytesRead;
     }
   }
   file.close();
-  Serial.println("> All bytes sent, waiting for Deepgram transcription");
+  Serial.println("> All bytes sent (" + String(totalSent) + " bytes), waiting for Deepgram transcription");
 
-  // Wait for Deepgram Server response (timeout after 12 seconds)
+  // Wait for response
   String response = "";
-  uint32_t timeout = 12000; // 12 seconds
+  uint32_t timeout = 15000; // Increased timeout
   uint32_t startWait = millis();
 
-  while (response == "" && (millis() - startWait) < timeout)
+  while ((millis() - startWait) < timeout)
   {
     while (client.available())
     {
       char c = client.read();
-      response += String(c);
+      response += c;
     }
+
+    if (response.length() > 0 && response.indexOf("}") > 0)
+    {
+      break; // Got complete response
+    }
+
     Serial.print(".");
     delay(100);
   }
@@ -904,16 +1007,19 @@ String SpeechToText_Deepgram(String audio_filename)
 
   if ((millis() - startWait) >= timeout)
   {
-    Serial.println("*** TIMEOUT ERROR - forced TIMEOUT after 12 seconds ***");
+    Serial.println("*** TIMEOUT ERROR - forced TIMEOUT after 15 seconds ***");
   }
 
   // Close connection
   client.stop();
 
-  // Parse JSON response
-  Serial.println(response);
-  String transcription = json_object(response, "\"transcript\":");
+  // Debug: Print first 200 chars of response
+  Serial.println("Raw response (first 200 chars):");
+  Serial.println(response.substring(0, 200));
+  Serial.println("---");
 
+  // Parse JSON response
+  String transcription = json_object(response, "\"transcript\":");
 
   uint32_t t_end = millis();
   Serial.println("=> TOTAL Duration [sec]: " + String((float)((t_end - t_start)) / 1000));
@@ -927,18 +1033,48 @@ String json_object(String input, String element)
 {
   String content = "";
   int pos_start = input.indexOf(element);
-  if (pos_start > 0)
+  if (pos_start >= 0) // Changed from > 0 to >= 0
   {
     pos_start += element.length();
-    int pos_end = input.indexOf(",\"", pos_start);
+
+    // Skip whitespace and quotes
+    while (pos_start < input.length() && (input.charAt(pos_start) == ' ' || input.charAt(pos_start) == '"'))
+    {
+      pos_start++;
+    }
+
+    // Find the end of the value
+    int pos_end = pos_start;
+    bool inQuotes = false;
+
+    while (pos_end < input.length())
+    {
+      char c = input.charAt(pos_end);
+      if (c == '"' && (pos_end == pos_start || input.charAt(pos_end - 1) != '\\'))
+      {
+        if (inQuotes)
+        {
+          break; // End of quoted string
+        }
+        inQuotes = true;
+      }
+      else if (!inQuotes && (c == ',' || c == '}' || c == ']'))
+      {
+        break;
+      }
+      pos_end++;
+    }
+
     if (pos_end > pos_start)
     {
       content = input.substring(pos_start, pos_end);
-    }
-    content.trim();
-    if (content.startsWith("\""))
-    {
-      content = content.substring(1, content.length() - 1);
+      content.trim();
+
+      // Remove surrounding quotes if present
+      if (content.startsWith("\"") && content.endsWith("\""))
+      {
+        content = content.substring(1, content.length() - 1);
+      }
     }
   }
   return content;
@@ -994,6 +1130,18 @@ void loop()
       digitalWrite(ATMEGA_CTRL_PIN, LOW);
       Serial.println("Sent logic 0 to ATmega32 (pin 40)");
       break;
+    case 'v':
+    case 'V':
+      if (lastTTSFile.length() > 0)
+      {
+        Serial.println("Replaying last TTS audio...");
+        playSpecificFile(lastTTSFile);
+      }
+      else
+      {
+        Serial.println("No TTS audio file available to replay.");
+      }
+      break;
     }
   }
 
@@ -1043,20 +1191,146 @@ void loop()
 
   delay(10); // Reduced delay
 }
+// Replace the end of speakWithDeepgram function with this:
+void speakWithDeepgram(String text)
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println("WiFi not connected. Cannot use Deepgram TTS.");
+    return;
+  }
 
+  Serial.println("\n=== Converting Text to Speech with Deepgram ===");
 
+  // Use WiFiClientSecure for HTTPS connection
+  WiFiClientSecure ttsClient;
+  ttsClient.setInsecure();
 
-// [env:esp32-s3-devkitc-1]
-// platform = espressif32
-// board = esp32-s3-devkitc-1
-// framework = arduino
-// monitor_speed = 115200
-// monitor_filters = esp32_exception_decoder
-// build_flags = 
-//     -DCORE_DEBUG_LEVEL=3
-//     -DARDUINO_USB_CDC_ON_BOOT=1
-//     -DCONFIG_ARDUINO_LOOP_STACK_SIZE=32768
-//     -DCONFIG_FREERTOS_UNICORE=1
-//     -DCONFIG_ESP_MAIN_TASK_STACK_SIZE=32768
-// lib_deps = 
-//     ArduinoJson
+  if (!ttsClient.connect("api.deepgram.com", 443))
+  {
+    Serial.println("Failed to connect to Deepgram TTS server");
+    return;
+  }
+
+  // Create JSON payload with specific encoding parameters
+  DynamicJsonDocument doc(1024);
+  doc["text"] = text;
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+
+  // Send HTTP request with encoding parameters to match your system
+  ttsClient.println("POST /v1/speak?model=aura-asteria-en&encoding=linear16&sample_rate=16000 HTTP/1.1");
+  ttsClient.println("Host: api.deepgram.com");
+  ttsClient.println("Authorization: Token " + String(DEEPGRAM_API_KEY));
+  ttsClient.println("Content-Type: application/json");
+  ttsClient.println("Accept: audio/wav");
+  ttsClient.println("Content-Length: " + String(requestBody.length()));
+  ttsClient.println();
+  ttsClient.print(requestBody);
+
+  Serial.println("TTS request sent to Deepgram...");
+
+  // Wait for response headers
+  String response = "";
+  unsigned long timeout = millis() + 10000;
+  bool headersComplete = false;
+
+  while (ttsClient.connected() && millis() < timeout && !headersComplete)
+  {
+    if (ttsClient.available())
+    {
+      String line = ttsClient.readStringUntil('\n');
+      response += line + "\n";
+
+      if (line == "\r")
+      {
+        headersComplete = true;
+        break;
+      }
+    }
+  }
+
+  // Check if request was successful
+  if (response.indexOf("200 OK") == -1)
+  {
+    Serial.println("TTS request failed. Response:");
+    Serial.println(response);
+    ttsClient.stop();
+    return;
+  }
+
+  Serial.println("TTS response received. Saving audio...");
+
+  // Create filename for TTS audio
+  String filename = "/tts_" + String(millis()) + ".wav";
+  File outFile = SD.open(filename, FILE_WRITE);
+
+  if (!outFile)
+  {
+    Serial.println("Failed to create file on SD!");
+    ttsClient.stop();
+    return;
+  }
+
+  // Write WAV header placeholder
+  for (int i = 0; i < 44; i++)
+  {
+    outFile.write((uint8_t)0);
+  }
+
+  uint32_t audioLength = 0;
+  uint8_t buffer[512];
+
+  // Read audio data from stream
+  Serial.println("Downloading audio data...");
+  while (ttsClient.connected() || ttsClient.available())
+  {
+    if (ttsClient.available())
+    {
+      int len = ttsClient.readBytes(buffer, sizeof(buffer));
+      if (len > 0)
+      {
+        outFile.write(buffer, len);
+        audioLength += len;
+        Serial.print(".");
+      }
+    }
+    else
+    {
+      delay(10);
+    }
+
+    if (millis() > timeout + 5000)
+    {
+      break;
+    }
+  }
+
+  Serial.println();
+
+  if (audioLength > 0)
+  {
+    // Use 16kHz to match your system configuration
+    writeWavHeader(outFile, 16000, 16, 1, audioLength);
+    outFile.close();
+    ttsClient.stop();
+
+    Serial.printf("TTS audio saved (%d bytes). Playing...\n", audioLength);
+
+    // Store the filename for replay with 'v' key
+    lastTTSFile = filename;
+
+    delay(500);
+
+    // Play the specific TTS file instead of latest recording
+    playSpecificFile(filename);
+  }
+  else
+  {
+    Serial.println("No audio data received from Deepgram TTS");
+    outFile.close();
+    ttsClient.stop();
+    SD.remove(filename.c_str());
+  }
+}
